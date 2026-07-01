@@ -1,0 +1,156 @@
+"""
+Synthetic enterprise meeting data generator.
+
+Produces 4,000+ realistic meeting records with attendees, opportunities,
+dependencies, and action items -- enough structure to build a real
+knowledge graph and exercise hybrid search meaningfully.
+"""
+import json
+import random
+from datetime import datetime, timedelta
+from pathlib import Path
+
+random.seed(42)
+
+DATA_DIR = Path(__file__).parent.parent / "data"
+
+COMPANIES = [
+    "Acme Robotics", "Northwind Analytics", "Blue Harbor Logistics", "Vertex Financial",
+    "Solstice Health", "Cascade Manufacturing", "Orbital Cloud", "Marigold Retail",
+    "Ironclad Security", "Pinnacle Energy", "Fenwick Legal Group", "Summit Biotech",
+    "Coral Systems", "Granite Insurance", "Beacon Media", "Lattice Semiconductors",
+    "Harborview Bank", "Trailhead Logistics", "Redwood Consulting", "Nimbus Data",
+]
+
+PEOPLE = [
+    "Priya Sharma", "James Okafor", "Elena Vasquez", "Wei Zhang", "Sofia Rossi",
+    "David Kim", "Aisha Bello", "Mark Thompson", "Yuki Tanaka", "Carlos Mendez",
+    "Rachel Cohen", "Liam O'Brien", "Ananya Iyer", "Noah Fischer", "Grace Park",
+    "Omar Haddad", "Isabella Silva", "Ethan Walker", "Fatima Al-Sayed", "Tom Becker",
+    "Nina Petrova", "Sam Alvarez", "Chloe Bennett", "Ravi Patel", "Lucas Meyer",
+]
+
+DEPARTMENTS = ["Sales", "Engineering", "Product", "Customer Success", "Legal",
+               "Finance", "Marketing", "Operations", "Executive", "Partnerships"]
+
+MEETING_TYPES = ["Discovery Call", "Technical Deep Dive", "Contract Negotiation",
+                  "Quarterly Business Review", "Onboarding Kickoff", "Renewal Discussion",
+                  "Escalation Review", "Product Demo", "Roadmap Alignment",
+                  "Vendor Risk Assessment", "Executive Sync", "Post-Mortem"]
+
+OPPORTUNITY_STAGES = ["Prospecting", "Qualification", "Proposal", "Negotiation",
+                       "Closed Won", "Closed Lost", "On Hold"]
+
+TOPICS = [
+    "pricing negotiation", "SSO integration requirements", "data residency compliance",
+    "API rate limiting concerns", "multi-year contract terms", "onboarding timeline",
+    "custom reporting needs", "SLA renegotiation", "security audit findings",
+    "migration from legacy system", "budget approval delays", "stakeholder alignment",
+    "technical integration blockers", "renewal risk factors", "expansion into new region",
+    "support escalation", "feature request prioritization", "billing dispute resolution",
+    "vendor consolidation strategy", "proof-of-concept results",
+]
+
+RISK_FLAGS = ["budget freeze", "champion left company", "competitor evaluation",
+              "legal review pending", "technical blocker unresolved", "no risk identified",
+              "executive sponsor change", "procurement delay"]
+
+DEPENDENCY_TYPES = ["blocks", "informs", "escalates_from", "follows_up_on", "relates_to"]
+
+
+def build_opportunities(n=350):
+    opps = []
+    for i in range(n):
+        company = random.choice(COMPANIES)
+        opps.append({
+            "id": f"OPP-{i+1:04d}",
+            "name": f"{company} - {random.choice(['New Business', 'Expansion', 'Renewal'])} {2024 + i % 3}",
+            "company": company,
+            "stage": random.choice(OPPORTUNITY_STAGES),
+            "value_usd": random.choice([15000, 45000, 90000, 150000, 250000, 500000, 1200000]),
+            "owner": random.choice(PEOPLE),
+        })
+    return opps
+
+
+def build_meetings(opportunities, n=4200):
+    meetings = []
+    start_date = datetime(2023, 1, 1)
+    for i in range(n):
+        opp = random.choice(opportunities)
+        meeting_date = start_date + timedelta(days=random.randint(0, 900),
+                                               hours=random.randint(8, 17))
+        attendees = random.sample(PEOPLE, k=random.randint(2, 6))
+        meeting_type = random.choice(MEETING_TYPES)
+        topic = random.choice(TOPICS)
+        risk = random.choice(RISK_FLAGS)
+        dept = random.choice(DEPARTMENTS)
+
+        summary = (
+            f"{meeting_type} with {opp['company']} regarding {topic}. "
+            f"Attendees discussed {random.choice(TOPICS)} and flagged {risk} as a "
+            f"consideration for the {opp['stage'].lower()} stage. "
+            f"Owner {opp['owner']} to follow up with {random.choice(attendees)}."
+        )
+
+        action_items = [
+            f"{random.choice(attendees)} to send {random.choice(['updated proposal', 'technical spec', 'pricing sheet', 'security questionnaire'])} by {(meeting_date + timedelta(days=random.randint(2,10))).strftime('%b %d')}",
+            f"Schedule follow-up on {random.choice(TOPICS)}",
+        ]
+
+        meetings.append({
+            "id": f"MTG-{i+1:05d}",
+            "title": f"{meeting_type}: {opp['company']}",
+            "date": meeting_date.isoformat(),
+            "type": meeting_type,
+            "department": dept,
+            "opportunity_id": opp["id"],
+            "company": opp["company"],
+            "attendees": attendees,
+            "topic": topic,
+            "risk_flag": risk,
+            "summary": summary,
+            "action_items": action_items,
+            "transcript_excerpt": (
+                f'"Regarding {topic}, we need to make sure {random.choice(attendees)} '
+                f'aligns with legal before next steps. The main concern is {risk}." '
+                f'-- {opp["owner"]}'
+            ),
+        })
+    return meetings
+
+
+def build_dependencies(meetings, n=1500):
+    """Graph edges: meeting -> meeting relationships (escalation chains, follow-ups)."""
+    deps = []
+    for i in range(n):
+        a, b = random.sample(meetings, 2)
+        deps.append({
+            "id": f"DEP-{i+1:04d}",
+            "source_meeting": a["id"],
+            "target_meeting": b["id"],
+            "type": random.choice(DEPENDENCY_TYPES),
+        })
+    return deps
+
+
+def main():
+    DATA_DIR.mkdir(exist_ok=True)
+    opportunities = build_opportunities(350)
+    meetings = build_meetings(opportunities, 4200)
+    dependencies = build_dependencies(meetings, 1500)
+
+    with open(DATA_DIR / "opportunities.json", "w") as f:
+        json.dump(opportunities, f, indent=2)
+    with open(DATA_DIR / "meetings.json", "w") as f:
+        json.dump(meetings, f, indent=2)
+    with open(DATA_DIR / "dependencies.json", "w") as f:
+        json.dump(dependencies, f, indent=2)
+
+    print(f"Generated {len(opportunities)} opportunities")
+    print(f"Generated {len(meetings)} meetings")
+    print(f"Generated {len(dependencies)} dependency edges")
+
+
+if __name__ == "__main__":
+    main()

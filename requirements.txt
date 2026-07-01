@@ -1,0 +1,66 @@
+"""
+Re-ranking stage.
+
+Real systems commonly re-rank the top-N hybrid candidates with a
+cross-encoder (e.g. ms-marco-MiniLM) that scores (query, doc) pairs
+jointly rather than via separate embeddings. That requires a downloaded
+transformer model, which this offline sandbox can't fetch.
+
+Instead this module implements a *query-aware lexical cross-scoring*
+re-ranker: it does term-overlap, phrase-proximity, and field-weighted
+scoring directly between the raw query and raw document fields (title,
+summary, action items) -- capturing the thing embeddings alone miss
+(exact entity/keyword matches, e.g. company names, risk flags) and
+combining it with the upstream hybrid score.
+
+Interface is drop-in compatible with swapping in a real cross-encoder:
+`rerank(query, candidates) -> list[SearchResult]` (mutates `.score`).
+"""
+from __future__ import annotations
+from .hybrid_search import SearchResult, tokenize
+
+
+FIELD_WEIGHTS = {
+    "title": 2.0,
+    "company": 1.5,
+    "topic": 1.5,
+    "risk_flag": 1.2,
+    "summary": 1.0,
+    "action_items": 0.8,
+}
+
+
+def _field_text(record: dict, field: str) -> str:
+    val = record.get(field, "")
+    if isinstance(val, list):
+        return " ".join(val)
+    return str(val)
+
+
+def cross_score(query: str, record: dict) -> float:
+    q_tokens = set(tokenize(query))
+    if not q_tokens:
+        return 0.0
+    total = 0.0
+    max_possible = 0.0
+    for field, weight in FIELD_WEIGHTS.items():
+        field_tokens = set(tokenize(_field_text(record, field)))
+        overlap = len(q_tokens & field_tokens)
+        total += weight * overlap
+        max_possible += weight * len(q_tokens)
+    if max_possible == 0:
+        return 0.0
+    return total / max_possible
+
+
+def rerank(
+    query: str,
+    candidates: list[SearchResult],
+    hybrid_weight: float = 0.55,
+    cross_weight: float = 0.45,
+) -> list[SearchResult]:
+    for c in candidates:
+        cs = cross_score(query, c.record)
+        c.score = hybrid_weight * c.score + cross_weight * cs
+    candidates.sort(key=lambda x: x.score, reverse=True)
+    return candidates

@@ -1,0 +1,167 @@
+"""
+Hybrid search over meeting records: dense vector search (Qdrant, in-process)
+fused with sparse BM25 lexical search, followed by a feature-based re-ranker.
+
+This mirrors a production architecture (Qdrant server + BM25 index +
+cross-encoder re-ranker) but runs fully in-process for the demo:
+  - Qdrant client runs in ":memory:" mode (same client/API as a real server)
+  - BM25 via rank_bm25
+  - Re-ranker combines lexical score, vector score, recency, and metadata
+    signals -- the same feature set a learned cross-encoder / LTR model
+    would use, just with hand-set weights instead of learned ones.
+"""
+from __future__ import annotations
+import re
+from dataclasses import dataclass, field
+from datetime import datetime
+
+import numpy as np
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qmodels
+from rank_bm25 import BM25Okapi
+
+from .embeddings import LocalEmbedder
+
+TOKEN_RE = re.compile(r"[a-zA-Z0-9']+")
+
+
+def tokenize(text: str) -> list[str]:
+    return TOKEN_RE.findall(text.lower())
+
+
+@dataclass
+class SearchResult:
+    doc_id: str
+    score: float
+    vector_score: float
+    bm25_score: float
+    recency_score: float
+    record: dict = field(default_factory=dict)
+
+
+class HybridSearchIndex:
+    """
+    Builds and queries a hybrid dense+sparse index over meeting records.
+    """
+
+    COLLECTION = "meetings"
+
+    def __init__(self, embed_dim: int = 128):
+        self.client = QdrantClient(location=":memory:")
+        self.embedder = LocalEmbedder(n_components=embed_dim)
+        self.embed_dim = embed_dim
+        self.bm25: BM25Okapi | None = None
+        self.records: dict[str, dict] = {}
+        self.id_order: list[str] = []
+        self._tokenized_corpus: list[list[str]] = []
+
+    @staticmethod
+    def _doc_text(record: dict) -> str:
+        return " ".join([
+            record.get("title", ""),
+            record.get("summary", ""),
+            record.get("topic", ""),
+            record.get("transcript_excerpt", ""),
+            " ".join(record.get("action_items", [])),
+            record.get("company", ""),
+        ])
+
+    def build(self, meetings: list[dict]) -> "HybridSearchIndex":
+        self.records = {m["id"]: m for m in meetings}
+        self.id_order = [m["id"] for m in meetings]
+        corpus = [self._doc_text(m) for m in meetings]
+
+        # --- Dense side: fit local embedder, upsert into Qdrant ---
+        self.embedder.fit(corpus)
+        vectors = self.embedder.embed(corpus)
+
+        self.client.recreate_collection(
+            collection_name=self.COLLECTION,
+            vectors_config=qmodels.VectorParams(
+                size=self.embed_dim, distance=qmodels.Distance.COSINE
+            ),
+        )
+        points = [
+            qmodels.PointStruct(
+                id=i,
+                vector=vectors[i].tolist(),
+                payload={"doc_id": self.id_order[i]},
+            )
+            for i in range(len(self.id_order))
+        ]
+        # batch upsert
+        BATCH = 256
+        for start in range(0, len(points), BATCH):
+            self.client.upsert(collection_name=self.COLLECTION, points=points[start:start + BATCH])
+
+        # --- Sparse side: BM25 ---
+        self._tokenized_corpus = [tokenize(t) for t in corpus]
+        self.bm25 = BM25Okapi(self._tokenized_corpus)
+
+        return self
+
+    def _recency_score(self, record: dict) -> float:
+        try:
+            dt = datetime.fromisoformat(record["date"])
+        except Exception:
+            return 0.0
+        days_old = (datetime(2025, 6, 1) - dt).days
+        # exponential decay, half-life ~ 180 days, clipped to [0, 1]
+        return float(max(0.0, min(1.0, 0.5 ** (days_old / 180))))
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 10,
+        candidate_pool: int = 60,
+        vector_weight: float = 0.5,
+        bm25_weight: float = 0.35,
+        recency_weight: float = 0.15,
+        filters: dict | None = None,
+    ) -> list[SearchResult]:
+        if self.bm25 is None:
+            raise RuntimeError("Index not built yet")
+
+        # Dense candidates
+        q_vec = self.embedder.embed([query])[0]
+        response = self.client.query_points(
+            collection_name=self.COLLECTION,
+            query=q_vec.tolist(),
+            limit=candidate_pool,
+        )
+        vector_scores = {self.id_order[h.id]: float(h.score) for h in response.points}
+
+        # Sparse candidates
+        tokenized_q = tokenize(query)
+        bm25_scores_all = self.bm25.get_scores(tokenized_q)
+        max_bm25 = max(bm25_scores_all.max(), 1e-9)
+        bm25_top_idx = np.argsort(-bm25_scores_all)[:candidate_pool]
+        bm25_scores = {
+            self.id_order[i]: float(bm25_scores_all[i] / max_bm25) for i in bm25_top_idx
+        }
+
+        candidate_ids = set(vector_scores) | set(bm25_scores)
+
+        results = []
+        for doc_id in candidate_ids:
+            record = self.records[doc_id]
+            if filters and not self._passes_filters(record, filters):
+                continue
+            v = vector_scores.get(doc_id, 0.0)
+            b = bm25_scores.get(doc_id, 0.0)
+            r = self._recency_score(record)
+            fused = vector_weight * v + bm25_weight * b + recency_weight * r
+            results.append(SearchResult(
+                doc_id=doc_id, score=fused, vector_score=v, bm25_score=b,
+                recency_score=r, record=record,
+            ))
+
+        results.sort(key=lambda x: x.score, reverse=True)
+        return results[:top_k]
+
+    @staticmethod
+    def _passes_filters(record: dict, filters: dict) -> bool:
+        for key, value in filters.items():
+            if record.get(key) != value:
+                return False
+        return True
